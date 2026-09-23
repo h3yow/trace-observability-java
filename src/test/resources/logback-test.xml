@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- 测试同样输出结构化 JSON，便于在测试日志中用 traceId 对账 -->
+    <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="com.github.h3yow.traceobservabilityjava.logging.JsonLogEncoder"/>
+    </appender>
+    <root level="INFO">
+        <appender-ref ref="JSON_CONSOLE"/>
+    </root>
+</configuration>
