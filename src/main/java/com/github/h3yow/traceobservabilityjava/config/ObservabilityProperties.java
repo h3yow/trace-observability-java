@@ -13,6 +13,7 @@ public class ObservabilityProperties {
     private int traceIdLength = 32;
     private int asyncPoolSize = 8;
     private int maxObservations = 1000;
+    private int latencyReservoirSize = 2048;
 
     public String getTraceHeader() { return traceHeader; }
     public void setTraceHeader(String traceHeader) { this.traceHeader = traceHeader; }
@@ -28,4 +29,9 @@ public class ObservabilityProperties {
 
     public int getMaxObservations() { return maxObservations; }
     public void setMaxObservations(int maxObservations) { this.maxObservations = maxObservations; }
+
+    public int getLatencyReservoirSize() { return latencyReservoirSize; }
+    public void setLatencyReservoirSize(int latencyReservoirSize) {
+        this.latencyReservoirSize = latencyReservoirSize;
+    }
 }

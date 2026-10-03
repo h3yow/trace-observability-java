@@ -30,7 +30,7 @@ public class ObservationConfig {
 
     @Bean
     public ObservationRegistry observationRegistry(ObservabilityProperties props) {
-        return new ObservationRegistry(props.getMaxObservations());
+        return new ObservationRegistry(props.getMaxObservations(), props.getLatencyReservoirSize());
     }
 
     @Bean

@@ -37,18 +37,40 @@ public class InternalMetricsController {
         MetricsStore m = registry.metrics();
         Map<String, Object> byOutcome = new LinkedHashMap<>();
         for (Outcome outcome : Outcome.values()) {
-            long count = m.count(outcome);
-            long totalNanos = m.totalNanos(outcome);
+            MetricsStore.LatencyStats stats = m.latencyStats(outcome);
             Map<String, Object> one = new LinkedHashMap<>();
-            one.put("count", count);
-            one.put("totalNanos", totalNanos);
-            one.put("totalMillis", nanosToMillis(totalNanos));
-            one.put("avgNanos", count == 0 ? 0 : totalNanos / count);
+            one.put("count", stats.count());
+            one.put("totalNanos", stats.totalNanos());
+            one.put("totalMillis", nanosToMillis(stats.totalNanos()));
+            one.put("avgNanos", stats.avgNanos());
+            one.put("p50Nanos", stats.p50Nanos());
+            one.put("p95Nanos", stats.p95Nanos());
+            one.put("p99Nanos", stats.p99Nanos());
+            one.put("p50Millis", nanosToMillis(stats.p50Nanos()));
+            one.put("p95Millis", nanosToMillis(stats.p95Nanos()));
+            one.put("p99Millis", nanosToMillis(stats.p99Nanos()));
+            one.put("latencySampleSize", stats.sampleSize());
             byOutcome.put(outcome.name(), one);
         }
+        MetricsStore.LatencyStats overall = m.overallLatencyStats();
+        Map<String, Object> overallView = new LinkedHashMap<>();
+        overallView.put("count", overall.count());
+        overallView.put("avgNanos", overall.avgNanos());
+        overallView.put("p50Nanos", overall.p50Nanos());
+        overallView.put("p95Nanos", overall.p95Nanos());
+        overallView.put("p99Nanos", overall.p99Nanos());
+        overallView.put("p50Millis", nanosToMillis(overall.p50Nanos()));
+        overallView.put("p95Millis", nanosToMillis(overall.p95Nanos()));
+        overallView.put("p99Millis", nanosToMillis(overall.p99Nanos()));
+        overallView.put("latencySampleSize", overall.sampleSize());
+        overallView.put("successRate", m.successRate());
+
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("total", m.totalCount());
+        result.put("successRate", m.successRate());
+        result.put("reservoirCapacity", m.reservoirCapacity());
         result.put("byOutcome", byOutcome);
+        result.put("overall", overallView);
         return result;
     }
 
