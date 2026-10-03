@@ -9,8 +9,25 @@ import java.util.regex.Pattern;
  *
  * <p>规则：上游提供的 traceId 匹配可配置正则时沿用（保持同一条链路）；
  * 缺失或非法时生成新的 traceId，避免脏标识进入系统。
+ *
+ * <p>同时兼容 W3C Trace Context（{@code traceparent} 头）。两种来源的取舍规则
+ * （明确且稳定，与到达顺序无关）：
+ * <ol>
+ *   <li>{@code traceparent} 合法 → 采用其中的 traceId（来源 {@link Source#W3C}），
+ *       其中的 parent-id 作为本服务根 span 的父 span；</li>
+ *   <li>否则自定义头（默认 {@code X-Trace-Id}）合法 → 沿用（来源 {@link Source#UPSTREAM}）；</li>
+ *   <li>两者都缺失/非法（含全零等不可信值）→ 重新生成（来源 {@link Source#GENERATED}）。</li>
+ * </ol>
+ * 一次请求只产出一套标识，日志与指标共用同一个 traceId。
  */
 public final class TracePropagator {
+
+    /** 追踪标识来源。 */
+    public enum Source { W3C, UPSTREAM, GENERATED }
+
+    /** 一次请求的标识取舍结果（不可变）。 */
+    public record InboundDecision(String traceId, String parentSpanId, Source source,
+                                  String inboundCustom, String inboundTraceparent) {}
 
     private static final char[] HEX = "0123456789abcdef".toCharArray();
 
@@ -57,6 +74,33 @@ public final class TracePropagator {
                 : generateTraceId();
         String requestId = randomHex(16);
         return new TraceContext(traceId, generateSpanId(), null, requestId);
+    }
+
+    /**
+     * 在两种来源之间做唯一取舍并创建根上下文。
+     *
+     * @param inboundCustom      自定义头（如 X-Trace-Id）的原始值，可能为 null
+     * @param inboundTraceparent W3C traceparent 头的原始值，可能为 null
+     */
+    public InboundDecision decide(String inboundCustom, String inboundTraceparent) {
+        Traceparent tp = Traceparent.parse(inboundTraceparent);
+        if (tp != null) {
+            return new InboundDecision(tp.traceId(), tp.parentSpanId(), Source.W3C,
+                    inboundCustom, inboundTraceparent);
+        }
+        if (isValid(inboundCustom)) {
+            return new InboundDecision(inboundCustom.trim().toLowerCase(Locale.ROOT), null,
+                    Source.UPSTREAM, inboundCustom, inboundTraceparent);
+        }
+        return new InboundDecision(generateTraceId(), null, Source.GENERATED,
+                inboundCustom, inboundTraceparent);
+    }
+
+    /** 依据取舍结果创建根上下文（父 span 仅当来源为 W3C 时存在）。 */
+    public TraceContext createRootContextFor(InboundDecision decision) {
+        String requestId = randomHex(16);
+        return new TraceContext(decision.traceId(), generateSpanId(),
+                decision.parentSpanId(), requestId);
     }
 
     /** 返回从请求头读取 traceId 所用的 header 名称。 */

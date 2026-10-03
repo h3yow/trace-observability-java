@@ -51,9 +51,12 @@ public final class TracingFilter implements Filter {
         HttpServletRequest httpRequest = (HttpServletRequest) request;
         HttpServletResponse httpResponse = (HttpServletResponse) response;
 
-        String inbound = httpRequest.getHeader(propagator.headerName());
-        boolean inboundValid = propagator.isValid(inbound);
-        TraceContext root = propagator.createRootContext(inbound);
+        String inboundCustom = httpRequest.getHeader(propagator.headerName());
+        String inboundTraceparent = httpRequest.getHeader(Traceparent.HEADER);
+        // 唯一取舍：W3C 合法 > 自定义头合法 > 重新生成；一次请求只有一套标识
+        TracePropagator.InboundDecision decision = propagator.decide(inboundCustom, inboundTraceparent);
+        TraceContext root = propagator.createRootContextFor(decision);
+        String traceSource = decision.source().name().toLowerCase(java.util.Locale.ROOT);
         Observation observation = registry.getOrCreate(root.traceId());
         ObservationContext observationContext = new ObservationContext(observation);
 
@@ -62,18 +65,22 @@ public final class TracingFilter implements Filter {
         MDC.put("traceId", root.traceId());
         MDC.put("spanId", root.spanId());
         MDC.put("requestId", root.requestId());
-        MDC.put("traceSource", inboundValid ? "upstream" : "generated");
+        MDC.put("traceSource", traceSource);
 
         RequestObservationAccess.setObservation(httpRequest, observation);
         if (httpResponse != null) {
+            // 回写最终实际采用的标识：自定义头 + W3C 标准头，方便任一侧上游关联
             httpResponse.setHeader(propagator.headerName(), root.traceId());
+            httpResponse.setHeader(Traceparent.HEADER,
+                    Traceparent.format(root.traceId(), root.spanId()));
         }
 
         long startNanos = System.nanoTime();
         Throwable failure = null;
-        log.info("request_start method={} path={} traceSource={} inboundTraceId={}",
-                httpRequest.getMethod(), pathOf(httpRequest),
-                inboundValid ? "upstream" : "generated", inboundValid ? inbound.trim() : "-");
+        log.info("request_start method={} path={} traceSource={} inboundTraceId={} inboundTraceparent={}",
+                httpRequest.getMethod(), pathOf(httpRequest), traceSource,
+                decision.source() == TracePropagator.Source.UPSTREAM ? inboundCustom.trim() : "-",
+                decision.source() == TracePropagator.Source.W3C ? inboundTraceparent.trim() : "-");
 
         try {
             chain.doFilter(httpRequest, httpResponse);
