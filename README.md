@@ -13,23 +13,35 @@
 
 | 维度 | 实现 | 本地获取方式 |
 | --- | --- | --- |
-| 追踪 | 每个请求一个 `traceId` + `spanId` + `requestId`，ThreadLocal + 线程池快照传播 | 响应头 `X-Trace-Id`、JSON 日志、`/internal/*` |
+| 追踪 | 每个请求一个 `traceId` + `spanId` + `requestId`，ThreadLocal + 线程池快照传播；同时兼容 W3C `traceparent` 与自定义头 | 响应头 `X-Trace-Id` + `traceparent`、JSON 日志、`/internal/*` |
 | 结构化日志 | 自研零依赖 JSON Logback Encoder，每行平铺 traceId/spanId/requestId | 控制台、`logs/observability.json.log` |
-| 指标 | 按归类计数 + 累计/平均耗时，线程安全（AtomicLong/CAS） | `GET /internal/metrics` |
+| 指标 | 按归类计数 + 累计/平均耗时 + p50/p95/p99 分位数 + 成功率，线程安全（AtomicLong/CAS + 有界环形样本池） | `GET /internal/metrics` |
 | 链路明细 | 每请求的最终归类、HTTP 状态、每次"尝试"记录 | `GET /internal/observations`、`/internal/observation?traceId=` |
 
 ---
 
 ## 2. 追踪传播规则
 
-### 2.1 traceId 的来源（沿用上游 vs 新生成）
+### 2.1 traceId 的来源（W3C / 自定义头 / 新生成）
 
-- 从请求头 `X-Trace-Id`（可配置 `observability.trace-header`）读取上游标识。
-- **合法**（匹配可配置正则，默认 `^[0-9a-fA-F]{16,32}$`）→ **原样沿用**，
-  从而与上游属于同一条链路；响应头回写同一个值。
-- **缺失（无该头）或非法（空、过短、含注入字符/非十六进制等）** →
-  服务端用 `SecureRandom` 生成新的 32 位小写十六进制 traceId。
-- 日志字段 `traceSource` 标明本次是 `upstream`（沿用）还是 `generated`（新生成）。
+系统同时接受两种上游追踪头，一次请求**只产出一套标识**，取舍规则明确且与到达顺序无关：
+
+1. **W3C `traceparent`**（`version-traceId-spanId-flags`，如
+   `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`）合法 → **优先采用**：
+   沿用其中的 traceId，spanId 作为本服务根 span 的父 span（来源记为 `w3c`）。
+   合法判定：恰好 4 段、version 为 2 位 hex 且不为 `ff`、traceId 为 32 位 hex、
+   spanId 为 16 位 hex、flags 为 2 位 hex，且 **traceId/spanId 都不得全零**
+   （全零属规范定义的不可信值）。缺字段、非 hex、长度错、`ff` 版本、全零 → 一律按无效处理。
+2. 否则**自定义头** `X-Trace-Id`（可配置 `observability.trace-header`）合法
+   （匹配可配置正则，默认 `^[0-9a-fA-F]{16,32}$`）→ 原样沿用（来源 `upstream`），
+   行为与旧版完全一致。
+3. 两者都缺失/非法 → 服务端用 `SecureRandom` 生成新的 32 位小写十六进制 traceId
+   （来源 `generated`）。
+
+**响应回写**：无论来源，响应同时回写 `X-Trace-Id: <最终 traceId>` 与
+`traceparent: 00-<最终 traceId>-<本服务 spanId>-01` 两个头，值是**最终实际采用**的同一套标识，
+上游用任一头都能关联；日志字段 `traceSource`（`w3c`/`upstream`/`generated`）标明取舍结果，
+日志、指标、响应头三方永远对得上。
 
 ### 2.2 同步与异步/后台之间如何保持一致
 
@@ -47,7 +59,23 @@
 - 子任务可用 `traceContext.withNewChildSpan(...)` 生成子 span：
   **traceId/requestId 不变，spanId 新建并以父 spanId 关联**。
 
-### 2.3 线程复用防泄漏（强约束）
+### 2.3 真·非阻塞异步（入口线程不等待结果）
+
+`GET /api/demo/nonblocking` 返回 `CompletableFuture`：Servlet 容器发现返回值是异步句柄后，
+**入口请求线程立即释放**回连接池去服务别的请求，业务在 `traceAwareExecutor` 工作线程上
+算完后由容器回调把响应写完。整条链路的口径：
+
+- **同一条链路**：工作线程经快照传播拿到同一 traceId/requestId/Observation；
+  完成回调与异常处理都发生在同一请求对象上，响应头、响应体、日志、指标里的
+  traceId 完全一致。
+- **归类只在异步真正完成时落定一次**：`TracingFilter` 发现 `isAsyncStarted()` 后
+  不在入口线程落定，而是注册 `AsyncListener`，在 `onComplete` 回调里用与同步路径
+  完全相同的口径（有效异常优先，其次状态码）做唯一一次 CAS 落定；
+  `onError/onTimeout` 不单独落定，避免迟到结论覆盖先到结论。
+- **异步异常可识别**：异步 dispatch 线程上没有 ThreadLocal，`GlobalExceptionHandler`
+  回退到请求属性里的 Observation 取 traceId，异常日志与错误响应体仍携带同一标识。
+
+### 2.4 线程复用防泄漏（强约束）
 
 工作线程执行任务时遵循"**先清空 → 写快照 → 执行 → finally 清空并还原**"：
 
@@ -106,17 +134,35 @@ total == count(SUCCESS)+count(BUSINESS_REJECTED)
 `ConcurrentLoadIntegrationTest` 在 192 个并发混合请求后严格断言该等式，
 并逐请求校验"已落定且归类与状态码一致"。
 
+### 3.3 延迟分位数与成功率（口径与淘汰规则）
+
+`/internal/metrics` 在计数之外，为**每个归类**以及 **overall（全部请求）**分别给出
+`p50/p95/p99`（同时提供 Nanos 与 Millis 两种单位）和整体 `successRate`
+（= SUCCESS 数 / 总数，空数据为 0，绝不出现 NaN）。
+
+- **分位数口径**：最近邻秩（nearest-rank）——把窗口内样本升序排序后取第
+  `ceil(q × n)` 个；空窗口返回 0，单样本时任何分位数都等于该样本。
+- **采样与淘汰**：每个归类一个容量固定（默认 2048，可配
+  `observability.latency-reservoir-size`）的**环形样本池**，内存占用恒定；
+  写满后新样本覆盖最老样本，即分位数始终反映"最近 N 次"请求的长尾。
+  **计数、累计耗时、成功率是全量精确值，不受淘汰影响**；
+  样本数未超容量时 `latencySampleSize == count`，可直接对账。
+- **并发正确性**：写入走 `AtomicLong` 槽位分配 + `AtomicLongArray`，
+  高并发下写入次数精确不丢（`LatencyReservoirTest`、
+  `PercentileMetricsIntegrationTest` 用 16 线程 × 500 次、8 线程 × 200 次验证）。
+
 ---
 
 ## 4. 可配置项（`src/main/resources/application.properties`）
 
 | 配置键 | 默认值 | 说明 |
 | --- | --- | --- |
-| `observability.trace-header` | `X-Trace-Id` | 读取/回写上游 traceId 的请求头名 |
+| `observability.trace-header` | `X-Trace-Id` | 读取/回写上游 traceId 的自定义请求头名（W3C `traceparent` 固定同时识别，无需配置） |
 | `observability.trace-id-pattern` | `^[0-9a-fA-F]{16,32}$` | 合法 traceId 正则；不匹配则新生成 |
 | `observability.trace-id-length` | `32` | 生成 traceId 的十六进制长度（自动夹在 16~32 以保证合法） |
 | `observability.async-pool-size` | `8` | 传播追踪上下文的工作线程池大小 |
 | `observability.max-observations` | `1000` | 进程内保留的链路明细条数上限（FIFO 淘汰；**计数指标不受淘汰影响**） |
+| `observability.latency-reservoir-size` | `2048` | 每个归类（及 overall）延迟分位数样本池容量；写满环形淘汰最老样本 |
 
 ---
 
@@ -128,6 +174,7 @@ total == count(SUCCESS)+count(BUSINESS_REJECTED)
 | --- | --- |
 | `GET /api/demo/sync?scenario=&timeoutMillis=` | 纯同步链路 |
 | `GET /api/demo/async?scenario=&timeoutMillis=` | 线程池异步后等待（验证跨线程传播） |
+| `GET /api/demo/nonblocking?scenario=&timeoutMillis=` | 真·非阻塞：返回 CompletableFuture，入口线程立即释放，后台算完后写响应 |
 | `GET /api/demo/retry?maxAttempts=3&failFirstN=1&timeoutMillis=10` | 前 N 次超时后成功/失败，验证重试去重与唯一归类 |
 | `GET /api/demo/background?scenario=` | 发射后台任务立即返回，验证迟到尝试不覆盖结论 |
 
@@ -135,7 +182,7 @@ total == count(SUCCESS)+count(BUSINESS_REJECTED)
 
 | 方法路径 | 说明 |
 | --- | --- |
-| `GET /internal/metrics` | 按归类的 count / totalNanos / totalMillis / avgNanos 与 total |
+| `GET /internal/metrics` | 按归类的 count / totalNanos / avgNanos / **p50/p95/p99**（Nanos+Millis）/ latencySampleSize，外加 overall 视图与 **successRate** |
 | `GET /internal/observations` | 所有请求的最终归类、状态、尝试明细 |
 | `GET /internal/observation?traceId=xxx` | 单条链路的可解释视图 |
 
@@ -149,13 +196,23 @@ total == count(SUCCESS)+count(BUSINESS_REJECTED)
 mvn test
 ```
 
-共 31 个用例，全部在本地 JVM 内完成，无需任何外部服务：
+共 57 个用例，全部在本地 JVM 内完成，无需任何外部服务：
 
 - `TracePropagatorTest`：上游标识缺失/非法（含注入串）→ 生成；合法 → 沿用；子 span 关联。
+- `W3CTraceparentTest`：traceparent 解析（合法/缺字段/非 hex/**全零**/`ff` 版本）、
+  两种来源共存时的取舍规则（W3C 优先 → 自定义头 → 生成）。
+- `W3CPropagationIntegrationTest`：端到端验证双头共存优先级、非法回退、
+  响应双头回写同一套标识、仅自定义头时旧行为不变。
 - `OutcomePolicyTest`：四类归类、JDK 超时、**深层包装异常**、按状态码归类。
 - `ObservationDedupTest`：attemptId 去重、CAS 唯一落定、**64 线程并发 settle** 仅 1 次成功。
 - `ThreadReuseLeakTest`：同一工作线程串行多请求不串扰、任务后无残留、200 任务/4 线程隔离。
 - `HttpObservabilityIntegrationTest`：真实 MockMvc 全链路（含超时/重试/异步/后台）。
+- `NonBlockingAsyncIntegrationTest`：真·非阻塞成功/超时/未预期异常下的上下文一致性、
+  入口线程释放（asyncStarted）、迟到结论不覆盖、异步链路沿用 W3C 标识。
+- `LatencyReservoirTest`：空池/单样本不 NaN、已知分布分位数精确、环形淘汰、
+  16 线程并发写入样本数与计数一致。
+- `PercentileMetricsIntegrationTest`：空指标不 NaN、分位数与计数对账、
+  成功率、8 线程并发 record 的正确性。
 - `ConcurrentLoadIntegrationTest`：192 个并发混合请求，traceId 唯一 + 指标守恒。
 - `InternalMetricsEndpointTest`：`/internal/metrics` 数字守恒、单链路明细可解释。
 
@@ -178,16 +235,31 @@ curl -i -H "X-Trace-Id: aabbccddeeff00112233445566778899" \
 # 非法标识被替换
 curl -i -H "X-Trace-Id: evil-injected-value" http://localhost:8080/api/demo/sync
 
+# W3C traceparent：合法则沿用其 traceId，响应同时回写 X-Trace-Id 与 traceparent
+curl -i -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
+  http://localhost:8080/api/demo/sync
+
+# 两种头同时出现：W3C 优先（响应两个头都是 traceparent 里的 traceId）
+curl -i -H "X-Trace-Id: aabbccddeeff00112233445566778899" \
+  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
+  http://localhost:8080/api/demo/sync
+
+# 全零 traceparent 不可信：回退到自定义头（或重新生成）
+curl -i -H "traceparent: 00-00000000000000000000000000000000-00f067aa0ba902b7-01" \
+  -H "X-Trace-Id: aabbccddeeff00112233445566778899" \
+  http://localhost:8080/api/demo/sync
+
 # 四类结果
 curl -i "http://localhost:8080/api/demo/sync?scenario=reject"                 # 422
 curl -i "http://localhost:8080/api/demo/sync?scenario=timeout&timeoutMillis=10" # 504
 curl -i "http://localhost:8080/api/demo/sync?scenario=bug"                    # 500
 
-# 异步 / 重试（先超时后成功，最终仍 SUCCESS 且只计数一次）
+# 异步 / 真·非阻塞 / 重试（先超时后成功，最终仍 SUCCESS 且只计数一次）
 curl "http://localhost:8080/api/demo/async?scenario=success"
+curl "http://localhost:8080/api/demo/nonblocking?scenario=success"
 curl "http://localhost:8080/api/demo/retry?maxAttempts=3&failFirstN=1&timeoutMillis=10"
 
-# 读取进程内指标与单链路
+# 读取进程内指标（含 p50/p95/p99 与 successRate）与单链路
 curl http://localhost:8080/internal/metrics
 curl "http://localhost:8080/internal/observation?traceId=<上一步的traceId>"
 ```
@@ -207,14 +279,16 @@ grep '<traceId>' logs/observability.json.log
 
 | 类 | 职责 |
 | --- | --- |
-| `trace.TracingFilter` | 请求入口：建上下文、写 MDC、出口唯一归类落定、finally 清理 |
-| `trace.TracePropagator` | 上游标识校验、traceId/spanId 生成、根上下文 |
+| `trace.TracingFilter` | 请求入口：双来源取舍建上下文、写 MDC、同步/异步（AsyncListener）唯一归类落定、finally 清理 |
+| `trace.TracePropagator` | 双来源取舍（W3C > 自定义头 > 生成）、标识校验与生成、根上下文 |
+| `trace.Traceparent` | W3C traceparent 解析与校验（缺字段/非 hex/全零/ff 版本均无效） |
 | `trace.TraceContext` / `TraceContextHolder` | 不可变上下文 / ThreadLocal |
 | `trace.ContextSnapshot` | 提交时快照 + 工作线程恢复/还原（防泄漏核心） |
 | `trace.ContextPropagatingExecutor(Service)` | 自动传播上下文的 Executor/ExecutorService |
 | `observation.Outcome(Policy)` | 四类归类与判定口径 |
 | `observation.Observation` | 尝试去重（putIfAbsent）+ 结论 CAS 落定 |
 | `observation.ObservationContext/Holder` | 请求级观测句柄及其 ThreadLocal |
-| `observation.ObservationRegistry/MetricsStore` | 进程内注册表与线程安全指标 |
+| `observation.ObservationRegistry/MetricsStore` | 进程内注册表与线程安全指标（计数 + 分位数 + 成功率） |
+| `observation.LatencyReservoir` | 有界环形延迟样本池，p50/p95/p99 最近邻秩分位数 |
 | `logging.JsonLogEncoder` | 零依赖结构化 JSON 日志（平铺 MDC） |
-| `web.GlobalExceptionHandler` | 三类异常 → 422/504/500（不计数，计数只在过滤器） |
+| `web.GlobalExceptionHandler` | 三类异常 → 422/504/500（不计数；异步 dispatch 线程经请求属性兜底 traceId） |
