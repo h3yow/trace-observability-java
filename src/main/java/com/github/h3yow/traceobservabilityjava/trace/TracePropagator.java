@@ -53,10 +53,18 @@ public final class TracePropagator {
      * 入站 traceId 合法则沿用（来源 upstream），否则生成新的（来源 generated）。
      */
     public TraceContext createRootContext(String inboundTraceId) {
+        return createRootContext(inboundTraceId, null);
+    }
+
+    /**
+     * 为请求创建根上下文，可携带上游父 spanId（来自 W3C traceparent）。
+     * 入站 traceId 已确认合法时原样沿用（转小写）；非法/缺失时生成新的。
+     */
+    public TraceContext createRootContext(String inboundTraceId, String parentSpanId) {
         String traceId = isValid(inboundTraceId) ? inboundTraceId.trim().toLowerCase(Locale.ROOT)
                 : generateTraceId();
         String requestId = randomHex(16);
-        return new TraceContext(traceId, generateSpanId(), null, requestId);
+        return new TraceContext(traceId, generateSpanId(), parentSpanId, requestId);
     }
 
     /** 返回从请求头读取 traceId 所用的 header 名称。 */

@@ -44,12 +44,34 @@ public class InternalMetricsController {
             one.put("totalNanos", totalNanos);
             one.put("totalMillis", nanosToMillis(totalNanos));
             one.put("avgNanos", count == 0 ? 0 : totalNanos / count);
+            one.put("latency", percentiles(m.samples(outcome)));
             byOutcome.put(outcome.name(), one);
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("total", m.totalCount());
+        result.put("successRate", m.successRate());
         result.put("byOutcome", byOutcome);
+        result.put("overall", percentiles(m.overallSamples()));
         return result;
+    }
+
+    /** 分位数视图：最近秩口径，纳秒与毫秒双单位；空数据全 0，绝不出现 NaN。 */
+    private Map<String, Object> percentiles(
+            com.github.h3yow.traceobservabilityjava.observation.LatencySamples samples) {
+        Map<String, Object> latency = new LinkedHashMap<>();
+        long p50 = samples.percentile(50);
+        long p95 = samples.percentile(95);
+        long p99 = samples.percentile(99);
+        latency.put("p50Nanos", p50);
+        latency.put("p95Nanos", p95);
+        latency.put("p99Nanos", p99);
+        latency.put("p50Millis", nanosToMillis(p50));
+        latency.put("p95Millis", nanosToMillis(p95));
+        latency.put("p99Millis", nanosToMillis(p99));
+        latency.put("sampleSize", samples.size());
+        latency.put("sampleCapacity", samples.capacity());
+        latency.put("samplesSeen", samples.seen());
+        return latency;
     }
 
     @GetMapping("/observations")

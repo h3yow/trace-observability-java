@@ -2,6 +2,8 @@ package com.github.h3yow.traceobservabilityjava.web;
 
 import com.github.h3yow.traceobservabilityjava.service.DemoService;
 import com.github.h3yow.traceobservabilityjava.trace.TraceContextHolder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -19,6 +21,8 @@ import java.util.concurrent.CompletionException;
 @RestController
 @RequestMapping("/api/demo")
 public class DemoController {
+
+    private static final Logger log = LoggerFactory.getLogger(DemoController.class);
 
     private final DemoService demoService;
 
@@ -70,6 +74,35 @@ public class DemoController {
         CompletableFuture<String> future = demoService.submitBackground(scenario, timeoutMillis);
         return body(scenario, "background-submitted", "future@" + Integer.toHexString(
                 System.identityHashCode(future)));
+    }
+
+    /**
+     * 真异步（非阻塞）：返回 {@link CompletableFuture}，Servlet 容器立即释放入口线程，
+     * 结果在 traceAwareExecutor 工作线程上算完后由异步派发写回响应。
+     *
+     * <p>跨线程链路一致性：执行、完成回调、异常处理、最终归类全部关联同一 traceId；
+     * 最终归类由 {@code TracingFilter} 注册的 AsyncListener 在异步周期结束时
+     * 以最终状态/异常 CAS 落定一次，入口线程不会提前下结论。
+     */
+    @GetMapping("/async-nonblocking")
+    public CompletableFuture<Map<String, Object>> asyncNonBlocking(
+            @RequestParam(defaultValue = "success") String scenario,
+            @RequestParam(defaultValue = "100") long timeoutMillis) {
+        String entryTraceId = TraceContextHolder.get().traceId();
+        log.info("async_release entryThread={} traceId={}",
+                Thread.currentThread().getName(), entryTraceId);
+        return demoService.callDependencyAsync(scenario, timeoutMillis)
+                // 完成回调：无论跑在工作线程还是（已完成的）入口线程，都必须看到同一标识
+                .whenComplete((result, error) -> {
+                    String callbackTraceId = TraceContextHolder.isPresent()
+                            ? TraceContextHolder.get().traceId() : "-";
+                    log.info("async_callback traceId={} entryTraceId={} consistent={} "
+                                    + "callbackThread={} outcome={}",
+                            callbackTraceId, entryTraceId, entryTraceId.equals(callbackTraceId),
+                            Thread.currentThread().getName(),
+                            error == null ? "success" : error.getClass().getSimpleName());
+                })
+                .thenApply(result -> body(scenario, "async-nonblocking", result));
     }
 
     private Map<String, Object> body(String scenario, String stage, String result) {

@@ -20,11 +20,16 @@ public final class ObservationRegistry {
 
     private final ConcurrentHashMap<String, Observation> observations = new ConcurrentHashMap<>();
     private final ConcurrentLinkedQueue<String> insertionOrder = new ConcurrentLinkedQueue<>();
-    private final MetricsStore metrics = new MetricsStore();
+    private final MetricsStore metrics;
     private final int maxObservations;
 
     public ObservationRegistry(int maxObservations) {
+        this(maxObservations, 2048);
+    }
+
+    public ObservationRegistry(int maxObservations, int latencySampleCapacity) {
         this.maxObservations = Math.max(10, maxObservations);
+        this.metrics = new MetricsStore(latencySampleCapacity);
     }
 
     /** 取得或创建某请求的 Observation。 */
