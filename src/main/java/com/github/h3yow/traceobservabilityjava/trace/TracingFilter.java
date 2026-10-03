@@ -6,6 +6,9 @@ import com.github.h3yow.traceobservabilityjava.observation.ObservationHolder;
 import com.github.h3yow.traceobservabilityjava.observation.Outcome;
 import com.github.h3yow.traceobservabilityjava.observation.OutcomePolicy;
 import com.github.h3yow.traceobservabilityjava.observation.ObservationRegistry;
+import jakarta.servlet.AsyncContext;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -88,12 +91,81 @@ public final class TracingFilter implements Filter {
             failure = t;
             throw t;
         } finally {
+            if (failure == null && httpRequest.isAsyncStarted()) {
+                // 真异步：控制器已把结果交给后台线程（如返回 CompletableFuture），
+                // 入口线程到此即可释放，归类推迟到异步真正完成时落定，
+                // 保证"执行中/完成回调/出错"全程仍挂在同一条链路上且只落定一次。
+                registerAsyncSettlement(httpRequest, observation, root, startNanos);
+                log.info("request_async_deferred traceId={} path={} note='入口线程释放，归类随异步完成落定'",
+                        root.traceId(), pathOf(httpRequest));
+            } else {
+                settleAndLog(httpRequest, httpResponse, observation, root, startNanos, failure);
+            }
+
+            // 关键：无论成功失败、是否异步，入口线程必须清理干净
+            TraceContextHolder.clear();
+            ObservationHolder.clear();
+            MDC.clear();
+        }
+    }
+
+    /**
+     * 给异步请求注册完成监听：异步结果（成功或异常）写完后由容器回调 onComplete，
+     * 在那里做唯一一次归类落定。onError/onTimeout 不直接落定——容器随后仍会
+     * 触发 onComplete，统一在一个地方 settle，避免迟到结论覆盖先到结论。
+     */
+    private void registerAsyncSettlement(HttpServletRequest request, Observation observation,
+                                         TraceContext root, long startNanos) {
+        AsyncContext asyncContext = request.getAsyncContext();
+        asyncContext.addListener(new AsyncListener() {
+            @Override
+            public void onComplete(AsyncEvent event) {
+                HttpServletRequest req = (HttpServletRequest) event.getSuppliedRequest();
+                HttpServletResponse res = (HttpServletResponse) event.getSuppliedResponse();
+                settleAndLog(req, res, observation, root, startNanos, null);
+            }
+
+            @Override
+            public void onTimeout(AsyncEvent event) {
+                log.warn("request_async_timeout traceId={} note='等待 onComplete 统一落定'",
+                        root.traceId());
+            }
+
+            @Override
+            public void onError(AsyncEvent event) {
+                log.warn("request_async_error traceId={} error={} note='等待 onComplete 统一落定'",
+                        root.traceId(),
+                        event.getThrowable() == null ? "-" : event.getThrowable().getClass().getSimpleName());
+            }
+
+            @Override
+            public void onStartAsync(AsyncEvent event) {
+                // 异步链上再次 startAsync（如异步中再派生）时无需处理，监听随上下文保留
+            }
+        });
+    }
+
+    /**
+     * 唯一归类落定点（同步路径在入口线程 finally 调用；异步路径在 onComplete 回调调用）。
+     * 归类口径：有效异常优先（能区分超时/业务拒绝/未预期），否则看 HTTP 状态码。
+     * CAS 保证先到结论不被后到覆盖、指标恰好计数一次。
+     */
+    private void settleAndLog(HttpServletRequest httpRequest, HttpServletResponse httpResponse,
+                              Observation observation, TraceContext root, long startNanos,
+                              Throwable failure) {
+        // 异步回调运行在容器线程上，ThreadLocal 没有上下文：先补 MDC 让日志可关联，结束再清
+        boolean mdcOwnedByUs = MDC.get("traceId") == null;
+        if (mdcOwnedByUs) {
+            MDC.put("traceId", root.traceId());
+            MDC.put("spanId", root.spanId());
+            MDC.put("requestId", root.requestId());
+        }
+        try {
             long durationNanos = System.nanoTime() - startNanos;
             int httpStatus = httpResponse.getStatus();
             Throwable handlerError = RequestObservationAccess.getError(httpRequest);
             Throwable effectiveError = failure != null ? failure : handlerError;
 
-            // 归类口径：有效异常优先（能区分超时/业务拒绝/未预期），否则看状态码
             Outcome outcome;
             String basis;
             if (effectiveError != null) {
@@ -113,11 +185,10 @@ public final class TracingFilter implements Filter {
                             + "durationNanos={} attempts={} basis='{}' lateSettleIgnored={}",
                     root.traceId(), pathOf(httpRequest), httpStatus, outcome, settled,
                     durationNanos, observation.attemptCount(), basis, !settled);
-
-            // 关键：无论成功失败、是否异步泄漏，入口线程必须清理干净
-            TraceContextHolder.clear();
-            ObservationHolder.clear();
-            MDC.clear();
+        } finally {
+            if (mdcOwnedByUs) {
+                MDC.clear();
+            }
         }
     }
 

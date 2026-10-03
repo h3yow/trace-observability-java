@@ -31,36 +31,52 @@ public class GlobalExceptionHandler {
     public ResponseEntity<Map<String, Object>> handleRejected(BusinessRejectedException e,
                                                               HttpServletRequest request) {
         RequestObservationAccess.setError(request, e);
-        log.warn("business_rejected traceId={} message={}", currentTraceId(), e.getMessage());
-        return build(HttpStatus.UNPROCESSABLE_ENTITY, "BUSINESS_REJECTED", e.getMessage());
+        log.warn("business_rejected traceId={} message={}", currentTraceId(request), e.getMessage());
+        return build(HttpStatus.UNPROCESSABLE_ENTITY, "BUSINESS_REJECTED", e.getMessage(),
+                currentTraceId(request));
     }
 
     @ExceptionHandler(DependencyTimeoutException.class)
     public ResponseEntity<Map<String, Object>> handleTimeout(DependencyTimeoutException e,
                                                              HttpServletRequest request) {
         RequestObservationAccess.setError(request, e);
-        log.error("dependency_timeout traceId={} message={}", currentTraceId(), e.getMessage());
-        return build(HttpStatus.GATEWAY_TIMEOUT, "DEPENDENCY_TIMEOUT", e.getMessage());
+        log.error("dependency_timeout traceId={} message={}", currentTraceId(request), e.getMessage());
+        return build(HttpStatus.GATEWAY_TIMEOUT, "DEPENDENCY_TIMEOUT", e.getMessage(),
+                currentTraceId(request));
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleUnexpected(Exception e,
                                                                 HttpServletRequest request) {
         RequestObservationAccess.setError(request, e);
-        log.error("unexpected_error traceId={}", currentTraceId(), e);
-        return build(HttpStatus.INTERNAL_SERVER_ERROR, "UNEXPECTED_ERROR", e.getClass().getSimpleName());
+        log.error("unexpected_error traceId={}", currentTraceId(request), e);
+        return build(HttpStatus.INTERNAL_SERVER_ERROR, "UNEXPECTED_ERROR", e.getClass().getSimpleName(),
+                currentTraceId(request));
     }
 
-    private static String currentTraceId() {
-        return TraceContextHolder.isPresent() ? TraceContextHolder.get().traceId() : "-";
+    /**
+     * 取当前请求 traceId：同步路径走 ThreadLocal；
+     * 异步（非阻塞）路径下异常处理运行在容器的异步 dispatch 线程上，ThreadLocal 为空，
+     * 此时回退到请求属性里的 Observation（同一请求对象跨 dispatch 保留），
+     * 保证异步异常日志与响应体里的 traceId 仍然和链路一致。
+     */
+    private static String currentTraceId(HttpServletRequest request) {
+        if (TraceContextHolder.isPresent()) {
+            return TraceContextHolder.get().traceId();
+        }
+        if (request != null && RequestObservationAccess.getObservation(request) != null) {
+            return RequestObservationAccess.getObservation(request).traceId();
+        }
+        return "-";
     }
 
-    private ResponseEntity<Map<String, Object>> build(HttpStatus status, String code, String message) {
+    private ResponseEntity<Map<String, Object>> build(HttpStatus status, String code, String message,
+                                                      String traceId) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("code", code);
         body.put("status", status.value());
         body.put("message", message);
-        body.put("traceId", currentTraceId());
+        body.put("traceId", traceId);
         return ResponseEntity.status(status).body(body);
     }
 }

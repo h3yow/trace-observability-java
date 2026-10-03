@@ -72,6 +72,19 @@ public class DemoController {
                 System.identityHashCode(future)));
     }
 
+    /**
+     * 真·非阻塞异步：返回 CompletableFuture，Servlet 入口线程立即释放去处理别的请求，
+     * 结果在传播了追踪上下文的工作线程上算完后，由容器回调把响应写完。
+     * 整个跨线程过程（执行/完成回调/异常）仍挂在同一条链路上，归类只落定一次。
+     */
+    @GetMapping("/nonblocking")
+    public CompletableFuture<Map<String, Object>> nonblocking(
+            @RequestParam(defaultValue = "success") String scenario,
+            @RequestParam(defaultValue = "100") long timeoutMillis) {
+        return demoService.callDependencyAsync(scenario, timeoutMillis)
+                .thenApply(result -> body(scenario, "nonblocking-async", result));
+    }
+
     private Map<String, Object> body(String scenario, String stage, String result) {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("traceId", TraceContextHolder.get().traceId());
