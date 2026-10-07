@@ -13,12 +13,13 @@ import java.util.regex.Pattern;
  * <p>同时兼容 W3C Trace Context（{@code traceparent} 头）。两种来源的取舍规则
  * （明确且稳定，与到达顺序无关）：
  * <ol>
- *   <li>{@code traceparent} 合法 → 采用其中的 traceId（来源 {@link Source#W3C}），
+ *   <li>{@code traceparent} <b>完全合法（仅小写 hex）</b> → 采用其中的 traceId（来源 {@link Source#W3C}），
  *       其中的 parent-id 作为本服务根 span 的父 span；</li>
  *   <li>否则自定义头（默认 {@code X-Trace-Id}）合法 → 沿用（来源 {@link Source#UPSTREAM}）；</li>
- *   <li>两者都缺失/非法（含全零等不可信值）→ 重新生成（来源 {@link Source#GENERATED}）。</li>
+ *   <li>两者都缺失/非法（含全零等不可信值，以及 traceparent 任意一段含大写字母）→ 重新生成（来源 {@link Source#GENERATED}）。</li>
  * </ol>
- * 一次请求只产出一套标识，日志与指标共用同一个 traceId。
+ * 一次请求只产出一套标识，日志、指标与响应回写的自定义头/traceparent 共用同一个 traceId。
+ * 非法标准头（如大写写法）中的 traceId 不会被沿用、归一化或写入日志/指标/响应头。
  */
 public final class TracePropagator {
 

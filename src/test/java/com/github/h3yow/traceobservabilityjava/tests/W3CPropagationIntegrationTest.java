@@ -141,4 +141,67 @@ class W3CPropagationIntegrationTest {
         assertNotNull(registry.get(W3C_TRACE_ID));
         assertEquals(1, registry.metrics().totalCount());
     }
+
+    @Test
+    @DisplayName("大写 traceparent + 合法自定义头：标准头按非法处理并回退，响应双头回写同一套标识")
+    void uppercaseTraceparentFallsBackToCustom() throws Exception {
+        // trace-id 整段大写：结构无误，唯一非法原因是 W3C 只允许小写 hex
+        String uppercaseTp = "00-" + W3C_TRACE_ID.toUpperCase() + "-" + W3C_SPAN_ID + "-01";
+        MvcResult result = mockMvc.perform(get("/api/demo/sync")
+                        .header("X-Trace-Id", CUSTOM_ID)
+                        .header("traceparent", uppercaseTp))
+                .andExpect(status().isOk()).andReturn();
+
+        String echoedCustom = result.getResponse().getHeader("X-Trace-Id");
+        String echoedTp = result.getResponse().getHeader("traceparent");
+        log.info("[输入] traceparent='{}'(trace-id 大写) + X-Trace-Id={} | [依据] 大写即非法 => 回退自定义头；"
+                + "实际 X-Trace-Id={} traceparent={}", uppercaseTp, CUSTOM_ID, echoedCustom, echoedTp);
+
+        assertEquals(CUSTOM_ID, echoedCustom, "标准头非法时必须回退自定义头");
+        assertNotNull(echoedTp);
+        assertTrue(TP_RESPONSE.matcher(echoedTp).matches(), "回写的 traceparent 必须是合法小写格式: " + echoedTp);
+        assertTrue(echoedTp.contains(CUSTOM_ID), "自定义头与 traceparent 必须回写同一个最终标识");
+        // 脏大写 trace-id 既不沿用也不落指标
+        assertNull(registry.get(W3C_TRACE_ID), "非法标准头的 trace-id 不得进入指标/明细");
+        assertNull(registry.get(W3C_TRACE_ID.toUpperCase()));
+        assertNotNull(registry.get(CUSTOM_ID));
+        assertEquals(1, registry.metrics().totalCount(), "一条请求只能有一套标识、计数一次");
+    }
+
+    @Test
+    @DisplayName("混合大小写 traceparent + 无自定义头：重新生成，响应双头同一套且不含入站脏值")
+    void mixedCaseTraceparentRegenerates() throws Exception {
+        String mixedTp = "00-" + W3C_TRACE_ID + "-" + W3C_SPAN_ID + "-0F"; // flags 一位大写
+        MvcResult result = mockMvc.perform(get("/api/demo/sync")
+                        .header("traceparent", mixedTp))
+                .andExpect(status().isOk()).andReturn();
+
+        String echoedCustom = result.getResponse().getHeader("X-Trace-Id");
+        String echoedTp = result.getResponse().getHeader("traceparent");
+        log.info("[输入] traceparent='{}'(flags 含大写) 无自定义头 | [依据] 非法 => 重新生成；"
+                + "实际 X-Trace-Id={} traceparent={}", mixedTp, echoedCustom, echoedTp);
+
+        assertTrue(HEX32.matcher(echoedCustom).matches());
+        assertNotEquals(W3C_TRACE_ID, echoedCustom, "不得沿用非法标准头中的 trace-id");
+        assertTrue(TP_RESPONSE.matcher(echoedTp).matches());
+        assertTrue(echoedTp.contains(echoedCustom), "两个响应头必须是同一套标识");
+        assertNull(registry.get(W3C_TRACE_ID), "入站非法 trace-id 不得产生观测链路");
+        assertEquals(1, registry.metrics().totalCount());
+    }
+
+    @Test
+    @DisplayName("合法小写 traceparent + 合法自定义头：既有 W3C 优先行为不受大小写收紧影响")
+    void lowercaseW3cStillTakesPrecedence() throws Exception {
+        MvcResult result = mockMvc.perform(get("/api/demo/sync")
+                        .header("X-Trace-Id", CUSTOM_ID)
+                        .header("traceparent", VALID_TP))
+                .andExpect(status().isOk()).andReturn();
+
+        String echoedCustom = result.getResponse().getHeader("X-Trace-Id");
+        log.info("[输入] 小写 traceparent={} + X-Trace-Id={} | [依据] 均合法 => 既有行为不变，W3C 优先；实际={}",
+                VALID_TP, CUSTOM_ID, echoedCustom);
+        assertEquals(W3C_TRACE_ID, echoedCustom);
+        assertNotNull(registry.get(W3C_TRACE_ID));
+        assertNull(registry.get(CUSTOM_ID));
+    }
 }

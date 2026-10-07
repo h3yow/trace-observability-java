@@ -1,7 +1,5 @@
 package com.github.h3yow.traceobservabilityjava.trace;
 
-import java.util.Locale;
-
 /**
  * W3C Trace Context 的 traceparent 头解析与校验（不可变值对象）。
  *
@@ -16,7 +14,11 @@ import java.util.Locale;
  *   <li>parentId(spanId) 为 16 位十六进制，且不得全零；</li>
  *   <li>flags 为 2 位十六进制。</li>
  * </ul>
- * 大小写不敏感，解析后统一归一为小写。
+ *
+ * <p>大小写口径严格对齐 W3C Trace Context：各段只允许<b>小写</b>十六进制
+ * （{@code 0-9a-f}）。任意一段、任意一位出现大写字母（整段大写或大小写混合）
+ * 都属于格式不合法，与缺字段、全零一样按无效处理，调用方必须回退/重新生成，
+ * 不得沿用其中的 trace-id。因此本类不做大小写归一化：合法输入本身即为小写。
  */
 public final class Traceparent {
 
@@ -44,21 +46,23 @@ public final class Traceparent {
         if (parts.length != 4) {
             return null;
         }
-        String version = parts[0].toLowerCase(Locale.ROOT);
-        String traceId = parts[1].toLowerCase(Locale.ROOT);
-        String parentId = parts[2].toLowerCase(Locale.ROOT);
-        String flags = parts[3].toLowerCase(Locale.ROOT);
+        String version = parts[0];
+        String traceId = parts[1];
+        String parentId = parts[2];
+        String flags = parts[3];
 
-        if (!isHex(version, 2) || "ff".equals(version)) {
+        // 严格按 W3C ABNF 校验：只接受小写 hex，任何大写/混合写法直接判无效，
+        // 不做 toLowerCase 归一化，避免把不合规的 trace-id 当可信值沿用。
+        if (!isLowerHex(version, 2) || "ff".equals(version)) {
             return null;
         }
-        if (!isHex(traceId, 32) || isAllZeros(traceId)) {
+        if (!isLowerHex(traceId, 32) || isAllZeros(traceId)) {
             return null;
         }
-        if (!isHex(parentId, 16) || isAllZeros(parentId)) {
+        if (!isLowerHex(parentId, 16) || isAllZeros(parentId)) {
             return null;
         }
-        if (!isHex(flags, 2)) {
+        if (!isLowerHex(flags, 2)) {
             return null;
         }
         return new Traceparent(version, traceId, parentId, flags);
@@ -79,12 +83,19 @@ public final class Traceparent {
         return "00-" + traceId + "-" + spanId + "-01";
     }
 
-    private static boolean isHex(String s, int len) {
+    /**
+     * 是否为恰好 {@code len} 位的<b>小写</b>十六进制字符串。
+     * W3C traceparent 的 ABNF 明确使用 lowercase {@code HEXDIGLC}，
+     * 大写字母（A-F）不属于合法字符，这里不做大小写兼容。
+     */
+    private static boolean isLowerHex(String s, int len) {
         if (s == null || s.length() != len) {
             return false;
         }
         for (int i = 0; i < len; i++) {
-            if (Character.digit(s.charAt(i), 16) < 0) {
+            char c = s.charAt(i);
+            boolean ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            if (!ok) {
                 return false;
             }
         }
