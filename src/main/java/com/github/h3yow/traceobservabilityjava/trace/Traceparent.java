@@ -1,7 +1,5 @@
 package com.github.h3yow.traceobservabilityjava.trace;
 
-import java.util.Locale;
-
 /**
  * W3C Trace Context 的 traceparent 头解析与校验（不可变值对象）。
  *
@@ -11,12 +9,17 @@ import java.util.Locale;
  * <p>校验规则（任一不满足即视为无效，调用方应重新生成标识）：
  * <ul>
  *   <li>必须恰好 4 段，以 '-' 分隔；</li>
- *   <li>version 为 2 位十六进制且不得为 "ff"（ff 为规范保留的非法值）；</li>
- *   <li>traceId 为 32 位十六进制，且不得全零（全零为规范定义的不可信值）；</li>
- *   <li>parentId(spanId) 为 16 位十六进制，且不得全零；</li>
- *   <li>flags 为 2 位十六进制。</li>
+ *   <li>version 为 2 位<b>小写</b>十六进制且不得为 "ff"（ff 为规范保留的非法值）；</li>
+ *   <li>traceId 为 32 位<b>小写</b>十六进制，且不得全零（全零为规范定义的不可信值）；</li>
+ *   <li>parentId(spanId) 为 16 位<b>小写</b>十六进制，且不得全零；</li>
+ *   <li>flags 为 2 位<b>小写</b>十六进制。</li>
  * </ul>
- * 大小写不敏感，解析后统一归一为小写。
+ *
+ * <p><b>大小写口径（W3C Trace Context）：</b>header 值中的十六进制字母只允许小写
+ * {@code [0-9a-f]}。任意一段（version/trace-id/parent-id/flags）中出现大写字母
+ * {@code A-F}——无论整段大写、仅一位大写还是大小写混写——一律按格式非法处理，
+ * 与缺字段、全零等同：其中的 traceId 不可信、不得沿用，调用方必须回退/重新生成。
+ * 本解析器不做大小写归一化（不会先 toLowerCase 再校验）。
  */
 public final class Traceparent {
 
@@ -44,21 +47,23 @@ public final class Traceparent {
         if (parts.length != 4) {
             return null;
         }
-        String version = parts[0].toLowerCase(Locale.ROOT);
-        String traceId = parts[1].toLowerCase(Locale.ROOT);
-        String parentId = parts[2].toLowerCase(Locale.ROOT);
-        String flags = parts[3].toLowerCase(Locale.ROOT);
+        // 关键：直接按原始字符严格校验，绝不能先 toLowerCase 再判 hex——
+        // W3C 规定 hex 字母只允许小写，任意一段出现 A-F（整段大写/一位大写/混写）即非法。
+        String version = parts[0];
+        String traceId = parts[1];
+        String parentId = parts[2];
+        String flags = parts[3];
 
-        if (!isHex(version, 2) || "ff".equals(version)) {
+        if (!isLowerHex(version, 2) || "ff".equals(version)) {
             return null;
         }
-        if (!isHex(traceId, 32) || isAllZeros(traceId)) {
+        if (!isLowerHex(traceId, 32) || isAllZeros(traceId)) {
             return null;
         }
-        if (!isHex(parentId, 16) || isAllZeros(parentId)) {
+        if (!isLowerHex(parentId, 16) || isAllZeros(parentId)) {
             return null;
         }
-        if (!isHex(flags, 2)) {
+        if (!isLowerHex(flags, 2)) {
             return null;
         }
         return new Traceparent(version, traceId, parentId, flags);
@@ -79,12 +84,14 @@ public final class Traceparent {
         return "00-" + traceId + "-" + spanId + "-01";
     }
 
-    private static boolean isHex(String s, int len) {
+    /** 严格小写十六进制校验：长度必须匹配，且每一位只能是 0-9 / a-f（A-F 一律拒绝）。 */
+    private static boolean isLowerHex(String s, int len) {
         if (s == null || s.length() != len) {
             return false;
         }
         for (int i = 0; i < len; i++) {
-            if (Character.digit(s.charAt(i), 16) < 0) {
+            char c = s.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
                 return false;
             }
         }

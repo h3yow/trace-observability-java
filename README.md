@@ -32,9 +32,17 @@
    合法判定：恰好 4 段、version 为 2 位 hex 且不为 `ff`、traceId 为 32 位 hex、
    spanId 为 16 位 hex、flags 为 2 位 hex，且 **traceId/spanId 都不得全零**
    （全零属规范定义的不可信值）。缺字段、非 hex、长度错、`ff` 版本、全零 → 一律按无效处理。
+
+   **大小写口径（严格按 W3C Trace Context 规范）：四段中的十六进制字母只接受小写
+   `[0-9a-f]`。** version/trace-id/span-id/flags 任意一段、任意一位出现大写字母 `A-F`
+   ——无论是整段大写、只有一位大写、还是大小写混写——都属于格式非法，与缺字段、全零
+   完全同等处理：其中的 traceId **不可信、不得沿用、不写入日志/指标/响应头**，
+   直接进入下面的回退流程。服务端**不做大小写归一化**（不会先转小写再放行）；
+   只有完全合法的小写 traceparent 才允许优先于自定义头。
 2. 否则**自定义头** `X-Trace-Id`（可配置 `observability.trace-header`）合法
-   （匹配可配置正则，默认 `^[0-9a-fA-F]{16,32}$`）→ 原样沿用（来源 `upstream`），
-   行为与旧版完全一致。
+   （匹配可配置正则，默认 `^[0-9a-fA-F]{16,32}$`，自定义头维持原有大小写宽松口径）→
+   原样沿用（来源 `upstream`），行为与旧版完全一致。
+   即：**标准头非法但自定义头合法时，回退采用自定义头**。
 3. 两者都缺失/非法 → 服务端用 `SecureRandom` 生成新的 32 位小写十六进制 traceId
    （来源 `generated`）。
 
@@ -196,13 +204,15 @@ total == count(SUCCESS)+count(BUSINESS_REJECTED)
 mvn test
 ```
 
-共 57 个用例，全部在本地 JVM 内完成，无需任何外部服务：
+共 65 个用例，全部在本地 JVM 内完成，无需任何外部服务：
 
 - `TracePropagatorTest`：上游标识缺失/非法（含注入串）→ 生成；合法 → 沿用；子 span 关联。
 - `W3CTraceparentTest`：traceparent 解析（合法/缺字段/非 hex/**全零**/`ff` 版本）、
-  两种来源共存时的取舍规则（W3C 优先 → 自定义头 → 生成）。
-- `W3CPropagationIntegrationTest`：端到端验证双头共存优先级、非法回退、
-  响应双头回写同一套标识、仅自定义头时旧行为不变。
+  **大小写严格口径（version/trace-id/span-id/flags 各段整段大写、单一位大写、大小写混写
+  一律拒绝；完全小写不受影响）**、两种来源共存时的取舍规则（合法小写 W3C 优先 →
+  非法标准头回退自定义头 → 两者不可用才生成）。
+- `W3CPropagationIntegrationTest`：端到端验证双头共存优先级、非法/全零/**大写及混写**
+  标准头回退、响应双头回写同一套标识（脏 traceId 不进日志/指标）、仅自定义头时旧行为不变。
 - `OutcomePolicyTest`：四类归类、JDK 超时、**深层包装异常**、按状态码归类。
 - `ObservationDedupTest`：attemptId 去重、CAS 唯一落定、**64 线程并发 settle** 仅 1 次成功。
 - `ThreadReuseLeakTest`：同一工作线程串行多请求不串扰、任务后无残留、200 任务/4 线程隔离。
@@ -249,6 +259,17 @@ curl -i -H "traceparent: 00-00000000000000000000000000000000-00f067aa0ba902b7-01
   -H "X-Trace-Id: aabbccddeeff00112233445566778899" \
   http://localhost:8080/api/demo/sync
 
+# 大写 traceparent（W3C 非法）+ 合法自定义头：拒绝标准头、回退自定义头，
+# 响应 X-Trace-Id 为 aabbcc...，traceparent 回写全小写且含同一 traceId
+curl -i -H "traceparent: 00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01" \
+  -H "X-Trace-Id: aabbccddeeff00112233445566778899" \
+  http://localhost:8080/api/demo/sync
+
+# 大小写混写 traceparent（W3C 非法）且无自定义头：重新生成，
+# 响应两个头都是新的 32 位小写 hex，脏 traceId 不出现在日志/指标/响应中
+curl -i -H "traceparent: 00-4Bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
+  http://localhost:8080/api/demo/sync
+
 # 四类结果
 curl -i "http://localhost:8080/api/demo/sync?scenario=reject"                 # 422
 curl -i "http://localhost:8080/api/demo/sync?scenario=timeout&timeoutMillis=10" # 504
@@ -281,7 +302,7 @@ grep '<traceId>' logs/observability.json.log
 | --- | --- |
 | `trace.TracingFilter` | 请求入口：双来源取舍建上下文、写 MDC、同步/异步（AsyncListener）唯一归类落定、finally 清理 |
 | `trace.TracePropagator` | 双来源取舍（W3C > 自定义头 > 生成）、标识校验与生成、根上下文 |
-| `trace.Traceparent` | W3C traceparent 解析与校验（缺字段/非 hex/全零/ff 版本均无效） |
+| `trace.Traceparent` | W3C traceparent 解析与校验（缺字段/非 hex/全零/ff 版本/**大写或混写 hex** 均无效，只接受小写） |
 | `trace.TraceContext` / `TraceContextHolder` | 不可变上下文 / ThreadLocal |
 | `trace.ContextSnapshot` | 提交时快照 + 工作线程恢复/还原（防泄漏核心） |
 | `trace.ContextPropagatingExecutor(Service)` | 自动传播上下文的 Executor/ExecutorService |

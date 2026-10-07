@@ -84,6 +84,99 @@ class W3CTraceparentTest {
     }
 
     @Test
+    @DisplayName("大小写：任意一段出现大写 hex 字母（整段大写/单段大写/仅一位/混写）一律无效")
+    void rejectsUppercaseHex() {
+        String upperTrace = VALID_TRACE_ID.toUpperCase(java.util.Locale.ROOT);
+        String upperSpan = VALID_SPAN_ID.toUpperCase(java.util.Locale.ROOT);
+        String[] invalid = {
+                // version 段一位大写（混写）
+                "0A-" + VALID_TRACE_ID + "-" + VALID_SPAN_ID + "-01",
+                // trace-id 整段大写
+                "00-" + upperTrace + "-" + VALID_SPAN_ID + "-01",
+                // trace-id 仅一位大写、其余小写（混写）
+                "00-4Bf92f3577b34da6a3ce929d0e0e4736-" + VALID_SPAN_ID + "-01",
+                // trace-id 末位大写（混写）
+                "00-4bf92f3577b34da6a3ce929d0e0e473A-" + VALID_SPAN_ID + "-01",
+                // parent-id 整段大写
+                "00-" + VALID_TRACE_ID + "-" + upperSpan + "-01",
+                // parent-id 一位大写（混写）
+                "00-" + VALID_TRACE_ID + "-00F067aa0ba902b7-01",
+                // flags 整段大写（小写 ff 合法，大写 FF 必须拒绝）
+                "00-" + VALID_TRACE_ID + "-" + VALID_SPAN_ID + "-FF",
+                // flags 一位大写（混写）
+                "00-" + VALID_TRACE_ID + "-" + VALID_SPAN_ID + "-0A",
+                // 整段全大写
+                VALID_TP.toUpperCase(java.util.Locale.ROOT),
+        };
+        for (String raw : invalid) {
+            Traceparent tp = Traceparent.parse(raw);
+            log.info("[输入] traceparent='{}' | [依据] 含大写 hex 字母 A-F（W3C 只允许小写）"
+                    + " => 期望 null，实际={}", raw, tp == null ? "null(无效)" : tp);
+            assertNull(tp, "大写/混写十六进制必须按无效处理: " + raw);
+        }
+    }
+
+    @Test
+    @DisplayName("大小写：完全小写的合法 traceparent 不受影响，正常解析")
+    void lowercaseStillAccepted() {
+        Traceparent tp = Traceparent.parse(VALID_TP);
+        log.info("[输入] traceparent='{}' | [依据] 全部为小写 hex => 期望解析成功", VALID_TP);
+        assertNotNull(tp);
+        assertEquals(VALID_TRACE_ID, tp.traceId());
+        assertEquals(VALID_SPAN_ID, tp.parentSpanId());
+        // 再覆盖几个含 a-f 字母的小写 version/flags 边界值，确认不是只认数字
+        String withLetters = "0a-abcdef0123456789abcdef0123456789-abcdef0123456789-0f";
+        Traceparent tp2 = Traceparent.parse(withLetters);
+        log.info("[输入] traceparent='{}' | [依据] 小写 a-f 合法 hex => 期望解析成功", withLetters);
+        assertNotNull(tp2, "小写 a-f 必须接受: " + withLetters);
+        assertEquals("0a", tp2.version());
+        assertEquals("0f", tp2.flags());
+    }
+
+    @Test
+    @DisplayName("取舍规则：大写/混写 traceparent 非法时，回退到合法自定义头（不能沿用其中的 traceId）")
+    void uppercaseTraceparentFallsBackToCustom() {
+        String upperTp = VALID_TP.toUpperCase(java.util.Locale.ROOT);
+        String mixedTp = "00-4Bf92f3577b34da6a3ce929d0e0e4736-" + VALID_SPAN_ID + "-01";
+        String[] invalidTps = {upperTp, mixedTp};
+        for (String badTp : invalidTps) {
+            TracePropagator.InboundDecision d = propagator.decide(CUSTOM_ID, badTp);
+            log.info("[输入] X-Trace-Id={} + traceparent='{}'(含大写) | [依据] 标准头非法 => "
+                    + "回退自定义头；实际 source={} traceId={}",
+                    CUSTOM_ID, badTp, d.source(), d.traceId());
+            assertEquals(TracePropagator.Source.UPSTREAM, d.source(),
+                    "大写标准头必须被拦下并回退: " + badTp);
+            assertEquals(CUSTOM_ID, d.traceId(), "不得沿用非法标准头里的 traceId: " + badTp);
+            assertNull(d.parentSpanId());
+        }
+    }
+
+    @Test
+    @DisplayName("取舍规则：大写 traceparent 与自定义头都不可用时重新生成，且不沿用脏值")
+    void uppercaseTraceparentAndBadCustomRegenerates() {
+        String upperTp = VALID_TP.toUpperCase(java.util.Locale.ROOT);
+        TracePropagator.InboundDecision d = propagator.decide("evil-id!!", upperTp);
+        log.info("[输入] X-Trace-Id='evil-id!!' + traceparent='{}'(全大写) | [依据] 两者均不可用 "
+                + "=> 重新生成 32 位小写 hex；实际={}", upperTp, d.traceId());
+        assertEquals(TracePropagator.Source.GENERATED, d.source());
+        assertTrue(d.traceId().matches("^[0-9a-f]{32}$"));
+        assertNotEquals(VALID_TRACE_ID, d.traceId(), "非法标准头中的 traceId 绝不能被沿用");
+        assertNotEquals(VALID_TRACE_ID.toUpperCase(java.util.Locale.ROOT), d.traceId());
+        assertNull(d.parentSpanId());
+    }
+
+    @Test
+    @DisplayName("取舍规则：两者同时合法（均小写）时标准头优先的既有行为不变")
+    void lowercaseW3cStillWins() {
+        TracePropagator.InboundDecision d = propagator.decide(CUSTOM_ID, VALID_TP);
+        log.info("[输入] X-Trace-Id={} + traceparent={}(全小写合法) | [依据] 既有规则不变 => W3C 优先",
+                CUSTOM_ID, VALID_TP);
+        assertEquals(TracePropagator.Source.W3C, d.source());
+        assertEquals(VALID_TRACE_ID, d.traceId());
+        assertEquals(VALID_SPAN_ID, d.parentSpanId());
+    }
+
+    @Test
     @DisplayName("version=ff 为规范保留的非法值，必须拒绝")
     void rejectsVersionFf() {
         String raw = "ff-" + VALID_TRACE_ID + "-" + VALID_SPAN_ID + "-01";
